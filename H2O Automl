@@ -1,0 +1,184 @@
+#Load the libraries
+library(DALEX)
+library(dplyr)
+library(h2o)
+
+# Data load
+
+claim1 <- read.csv("claims.csv", header = TRUE)
+
+claim2 <- subset(claim1, select = c(4,5,9:16,19,21,23:25,28:30,33))
+head(claim2)
+#Initiate H2o
+h2o.init()
+
+# convert to h2o object
+df.h2o <- as.h2o(claim2)
+
+
+
+# create train, validation, and test splits
+set.seed(123)
+splits <- h2o.splitFrame(df.h2o, ratios = c(.7, .15), destination_frames = c("train","valid","test"))
+names(splits) <- c("train","valid","test")
+
+# variable names for resonse & features
+y <- "FraudFound_P"
+x <- setdiff(names(df.h2o), y) 
+names(df.h2o)
+
+Features = ("'Make','AccidentArea','MonthClaimed','Sex','Age','Fault','PolicyType','VehicleCategory','VehiclePrice','Deductible',
+'Days_Policy_Accident','PastNumberOfClaims','AgeOfVehicle','AgeOfPolicyHolder','AgentType','NumberOfSuppliments',
+'AddressChange_Claim','Year','BasePolicy'")
+
+
+# For binary classification, response should be a factor
+splits$train[,y] <- as.factor(splits$train[,y])
+splits$test[,y] <- as.factor(splits$test[,y])
+splits$valid[,y] <- as.factor(splits$valid[,y])
+
+# Logistic model 
+?h2o.glm
+
+table(claim2$FraudFound_P)
+
+?h2o.glm
+glm <- h2o.glm(
+  x = x, 
+  y = y, 
+  training_frame = splits$train,
+  validation_frame = splits$valid,
+  family = "binomial",
+  seed = 123
+)
+head(splits$valid)
+# random forest model
+rf <- h2o.randomForest(
+  x = x, 
+  y = y,
+  training_frame = splits$train,
+  validation_frame = splits$valid,
+  ntrees = 1000,
+  stopping_metric = "AUC",    
+  stopping_rounds = 10,         
+  stopping_tolerance = 0.005,
+  seed = 123
+)
+
+?h2o.randomForest
+# gradient boosting machine model
+gbm <-  h2o.gbm(
+  x = x, 
+  y = y,
+  training_frame = splits$train,
+  validation_frame = splits$valid,
+  ntrees = 1000,
+  stopping_metric = "AUC",    
+  stopping_rounds = 10,         
+  stopping_tolerance = 0.005,
+  seed = 123
+)
+
+
+
+# model performance by AUC score
+h2o.auc(glm, valid = TRUE)
+h2o.auc(rf, valid = TRUE)
+h2o.auc(gbm, valid = TRUE)
+
+# convert feature data to non-h2o objects for dalex interpretation
+x_valid <- as.data.frame(splits$valid)[, x]
+
+# make response variable numeric binary vector
+y_valid <- as.vector(as.numeric(as.character(splits$valid$FraudFound_P)))
+head(y_valid)
+
+
+# create custom predict function
+pred1 <- function(model, newdata)  {
+  results <- as.data.frame(h2o.predict(model, as.h2o(newdata)))
+  return(results[[3L]])
+}
+
+pred1(glm, x_valid) %>% head()
+
+
+# elastic net explainer
+?explain
+explainer_glm <- explain(
+  model = glm,
+  data = x_valid,
+  y = y_valid,
+  predict_function = pred1,
+  label = "h2o glm"
+)
+
+# random forest explainer
+explainer_rf <- explain(
+  model = rf,
+  data = x_valid,
+  y = y_valid,
+  predict_function = pred1,
+  label = "h2o rf"
+)
+
+# GBM explainer
+explainer_gbm <- explain(
+  model = gbm,
+  data = x_valid,
+  y = y_valid,
+  predict_function = pred1,
+  label = "h2o gbm"
+)
+
+# summary of explainer object
+class(explainer_glm)
+
+summary(explainer_glm)
+
+# compute predictions & residuals
+resids_glm <- model_performance(explainer_glm)
+resids_rf  <- model_performance(explainer_rf)
+resids_gbm <- model_performance(explainer_gbm)
+
+# assess quantiles for residuals
+resids_glm
+resids_rf
+resids_gbm
+
+# create comparison plot of residuals for each model
+p1 <- plot(resids_glm, resids_rf, resids_glm)
+p2 <- plot(resids_glm, resids_rf, resids_gbm, geom = "boxplot")
+
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+
+# compute permutation-based variable importance
+vip_glm <- variable_importance(explainer_glm, n_sample = -1, type = 'raw')
+?variable_importance
+vip_rf  <- variable_importance(explainer_rf, n_sample = -1, loss_function = loss_root_mean_square)
+vip_gbm <- variable_importance(explainer_gbm, n_sample = -1, loss_function = loss_root_mean_square)
+
+?variable_importance
+
+plot(vip_glm, max_vars = 15)
+
+?
+
+##################################More models - Auto ML####################################################
+
+max <- .7
+aml <- h2o.automl(y = y, x = x,
+                  training_frame = splits$train,
+                  balance_classes = TRUE,
+                  max_after_balance_size = max,
+                  max_models = 10,
+                  seed = 1)
+
+
+lb <- aml@leaderboard
+print(lb, n = nrow(lb))
+
+plot_h2o_leaderboard()
+
+############################################################################################################
+
